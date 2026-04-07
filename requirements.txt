@@ -1,0 +1,49 @@
+# Enterprise Data Platform — Python Dependencies
+# Python 3.11+ required
+#
+# Note: Terraform is NOT a Python package and must be installed separately.
+# Installation: https://developer.hashicorp.com/terraform/downloads
+# Recommended: tfenv (https://github.com/tfutils/tfenv) for version management
+#   brew install tfenv && tfenv install 1.6.6 && tfenv use 1.6.6
+
+# ── Orchestration ─────────────────────────────────────────────────────────────
+apache-airflow==2.8.0
+
+# ── Distributed Processing ────────────────────────────────────────────────────
+pyspark==3.4.1
+delta-spark==2.4.0
+
+# ── Transformation (dbt) ──────────────────────────────────────────────────────
+dbt-bigquery==1.7.0
+dbt-core==1.7.0               # pulled transitively by dbt-bigquery; pinned for reproducibility
+
+# ── Streaming / Messaging ─────────────────────────────────────────────────────
+kafka-python==2.0.2
+fastavro==1.9.0               # Avro serialization/deserialization (Schema Registry wire format)
+
+# ── Data Quality ──────────────────────────────────────────────────────────────
+great-expectations==0.18.0
+
+# ── Google Cloud Platform ─────────────────────────────────────────────────────
+google-cloud-bigquery==3.13.0
+google-cloud-storage==2.13.0
+google-cloud-bigquery-storage==2.24.0   # Arrow-based fast reads from BigQuery
+google-auth==2.26.0
+google-auth-httplib2==0.2.0
+
+# ── Data Processing / Utilities ───────────────────────────────────────────────
+pandas==2.1.0
+pyarrow==14.0.1               # Parquet serialization for GCS writes
+numpy==1.26.0                 # Numerical ops (z-score, rolling stats)
+
+# ── HTTP / Alerting ───────────────────────────────────────────────────────────
+requests==2.31.0              # Slack webhooks, PagerDuty Events API, Schema Registry
+
+# ── Development / Testing ─────────────────────────────────────────────────────
+pytest==7.4.4
+pytest-cov==4.1.0
+black==23.12.1
+isort==5.13.2
+flake8==7.0.0
+mypy==1.8.0
+pre-commit==3.6.0
