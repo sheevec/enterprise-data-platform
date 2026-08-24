@@ -38,6 +38,18 @@ bronze-submit-local:
 		--conf spark.pyspark.python=$(VENV)/bin/python \
 		src/processing/bronze_streaming.py
 
+silver-submit-local:
+	$(VENV)/bin/spark-submit \
+		--packages io.delta:delta-core_2.12:2.4.0 \
+		--conf spark.pyspark.python=$(VENV)/bin/python \
+		src/processing/bronze_to_silver.py
+
+optimize-submit-local:
+	$(VENV)/bin/spark-submit \
+		--packages io.delta:delta-core_2.12:2.4.0 \
+		--conf spark.pyspark.python=$(VENV)/bin/python \
+		src/maintenance/table_optimization.py
+
 coverage:
 	$(VENV)/bin/pytest tests/unit --cov=src --cov-report=term-missing --cov-report=html
 

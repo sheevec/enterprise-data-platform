@@ -98,35 +98,11 @@ class TestContract:
 
 
 # ---------------------------------------------------------------------------
-# Spark-backed decode path (local session; skips cleanly without Java)
+# Spark-backed decode path (shared session fixture from conftest.py;
+# fabricates Confluent wire-format records in memory — no Kafka/GCS/network)
 # ---------------------------------------------------------------------------
 
-spark_session = pytest.importorskip("pyspark.sql")
-
-
-@pytest.fixture(scope="module")
-def spark():
-    import os
-    import sys
-
-    from pyspark.sql import SparkSession
-
-    # Workers must use THIS interpreter: bare `python3` from PATH may be a
-    # newer Python where pyspark 3.4's typing.io import crashes the worker.
-    os.environ["PYSPARK_PYTHON"] = sys.executable
-    os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
-
-    session = (
-        SparkSession.builder.master("local[2]")
-        .appName("bronze-it")
-        # spark-avro is NOT bundled in the pip pyspark distribution
-        .config("spark.jars.packages", "org.apache.spark:spark-avro_2.12:3.4.1")
-        .config("spark.ui.enabled", "false")
-        .config("spark.sql.shuffle.partitions", "2")
-        .getOrCreate()
-    )
-    yield session
-    session.stop()
+pytest.importorskip("pyspark.sql")
 
 
 class TestTransformBatch:
