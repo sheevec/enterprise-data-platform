@@ -1,25 +1,28 @@
 """
 dq_runner.py
 ------------
-spark-submit entrypoint: run the DataQualityFramework against Silver Delta
-tables and exit non-zero on a P1 failure — the promotion gate wired into the
-Airflow silver DAG between merge and downstream consumption.
+spark-submit entrypoint: run DISTRIBUTED data-quality validation over Silver
+Delta tables and exit non-zero on a P1 failure — the promotion gate wired into
+the Airflow silver DAG between merge and downstream consumption.
 
-Reads a table, samples (bounded by driver memory), validates against the
-configured suite for that dataset, and prints the ValidationResult summary.
+Full-table, in-cluster validation via DistributedExpectationEngine: the whole
+suite compiles to a single Spark aggregate pass; NO data is pulled to the
+driver (this replaces the legacy sample().toPandas() flow, which at TB scale
+meant driver OOMs and samples that statistically miss rare defects).
 
 Env:
     DQ_SUITES_DIR                    — directory of suite JSON files
     DQ_GATE_TABLES_JSON              — [{"table_path": "gs://...", "dataset_name":
                                         "payments_silver", "suite_name": "...",
-                                        "layer": "silver", "sample_fraction": 0.1}]
-    plus optional DQ_* alerting vars consumed by build_framework_from_env
+                                        "layer": "silver"}]
+    plus optional DQ_* alerting vars consumed by DataQualityFramework
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 
 from pyspark.sql import SparkSession
@@ -36,8 +39,6 @@ logger = logging.getLogger(__name__)
 
 
 def build_framework() -> DataQualityFramework:
-    import os
-
     return DataQualityFramework(
         DataQualityConfig(
             suites_dir=os.environ["DQ_SUITES_DIR"],
@@ -48,14 +49,12 @@ def build_framework() -> DataQualityFramework:
 
 def validate_table(spark: SparkSession, framework: DataQualityFramework, spec: dict) -> str:
     df = spark.read.format("delta").load(spec["table_path"])
-    sampled = df.sample(fraction=float(spec.get("sample_fraction", 0.1)), seed=42).toPandas()
-
     suite_cfg = SuiteConfig(
         suite_name=spec["suite_name"],
         layer=DataLayer(spec.get("layer", "silver")),
         dataset_name=spec["dataset_name"],
     )
-    result = framework.validate(sampled, suite_cfg)
+    result = framework.validate_spark_distributed(df, suite_cfg)
     return result.summary
 
 
@@ -63,7 +62,6 @@ def main() -> int:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s"
     )
-    import os
 
     specs = json.loads(os.environ.get("DQ_GATE_TABLES_JSON", "[]"))
     if not specs:

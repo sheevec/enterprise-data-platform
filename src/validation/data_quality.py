@@ -281,21 +281,7 @@ class DataQualityFramework:
         )
 
         logger.info("Validation complete: %s", result.summary)
-
-        # Generate reports
-        report_path = self._generate_report(result)
-        result.report_path = report_path
-
-        # Persist DQS to BigQuery
-        if self._bq_client:
-            self._write_dqs_to_bigquery(result)
-
-        # Send alerts if threshold breached
-        if not passed_threshold:
-            self._send_alerts(result)
-            if self._config.raise_on_failure and severity == AlertSeverity.P1:
-                raise DataQualityError(result)
-
+        self._finalize_result(result)
         return result
 
     def validate_spark_dataframe(
@@ -306,22 +292,102 @@ class DataQualityFramework:
         run_id: Optional[str] = None,
     ) -> ValidationResult:
         """
-        Validate a PySpark DataFrame by sampling and converting to Pandas.
-        For very large DataFrames, sampling is recommended to keep validation fast.
+        DEPRECATED — driver-sampling path. Kept for backwards compatibility.
 
-        Args:
-            spark_df: PySpark DataFrame to validate.
-            suite_config: Suite configuration.
-            sample_fraction: Fraction of rows to sample for validation (default 10%).
-            run_id: Optional run identifier.
+        Pulls a sample to driver memory via toPandas(): at TB scale even 10%
+        is enormous on one machine, and sampling statistically misses rare
+        defects. Use validate_spark_distributed() instead.
         """
-        logger.info(
-            "Sampling %d%% of Spark DataFrame for validation | suite=%s",
-            int(sample_fraction * 100),
+        logger.warning(
+            "validate_spark_dataframe uses driver sampling (toPandas) — "
+            "switch to validate_spark_distributed for full-scan in-cluster "
+            "validation. suite=%s",
             suite_config.suite_name,
         )
         sampled_df = spark_df.sample(fraction=sample_fraction, seed=42).toPandas()
         return self.validate(sampled_df, suite_config, run_id=run_id)
+
+    def validate_spark_distributed(
+        self,
+        spark_df: Any,  # pyspark.sql.DataFrame
+        suite_config: SuiteConfig,
+        run_id: Optional[str] = None,
+    ) -> ValidationResult:
+        """
+        Full-table validation IN Spark — no data ever reaches the driver
+        except the single aggregate row of expectation outcomes.
+
+        The whole suite compiles into ONE df.agg(...) pass regardless of how
+        many expectations it contains (see src/validation/distributed_dq.py).
+        Reports/alerts/DQS-persistence behave identically to validate().
+        """
+        from src.validation.distributed_dq import DistributedExpectationEngine
+
+        run_id = run_id or str(uuid.uuid4())
+        evaluated_at = datetime.now(timezone.utc).isoformat()
+
+        logger.info(
+            "Starting DISTRIBUTED validation | run_id=%s | suite=%s | dataset=%s",
+            run_id,
+            suite_config.suite_name,
+            suite_config.dataset_name,
+        )
+
+        suite = self._load_suite(suite_config)
+        engine = DistributedExpectationEngine()
+        expectation_results = engine.evaluate(spark_df, suite)
+
+        total = len(expectation_results)
+        passed = sum(1 for r in expectation_results if r.success)
+        failed = total - passed
+        dqs = passed / total if total > 0 else 0.0
+        passed_threshold = dqs >= suite_config.threshold
+        severity = self._compute_severity(dqs, suite_config.threshold)
+
+        result = ValidationResult(
+            run_id=run_id,
+            dataset_name=suite_config.dataset_name,
+            suite_name=suite_config.suite_name,
+            layer=suite_config.layer,
+            evaluated_at_utc=evaluated_at,
+            total_expectations=total,
+            passed_expectations=passed,
+            failed_expectations=failed,
+            data_quality_score=dqs,
+            threshold=suite_config.threshold,
+            passed_threshold=passed_threshold,
+            severity=severity,
+            expectation_results=expectation_results,
+            row_count=-1,  # resolved below via row-count expectation if present
+        )
+
+        # Prefer an explicit row-count expectation's observed value; else ask once.
+        rc = next(
+            (
+                r.observed_value
+                for r in expectation_results
+                if r.expectation_type == "expect_table_row_count_to_be_between"
+            ),
+            None,
+        )
+        result.row_count = int(rc) if isinstance(rc, int) else int(spark_df.count())
+
+        logger.info("Distributed validation complete: %s", result.summary)
+        self._finalize_result(result)
+        return result
+
+    def _finalize_result(self, result: ValidationResult) -> None:
+        """Shared post-validation side effects: report → BQ → alerts → raise."""
+        report_path = self._generate_report(result)
+        result.report_path = report_path
+
+        if self._bq_client:
+            self._write_dqs_to_bigquery(result)
+
+        if not result.passed_threshold:
+            self._send_alerts(result)
+            if self._config.raise_on_failure and result.severity == AlertSeverity.P1:
+                raise DataQualityError(result)
 
     def load_all_suites(self) -> List[str]:
         """Return the names of all available expectation suites in suites_dir."""
@@ -518,9 +584,9 @@ class DataQualityFramework:
         col = kwargs["column"]
         value_set = set(kwargs["value_set"])
         mostly = kwargs.get("mostly", 1.0)
-        total = len(df)
-        invalid_mask = ~df[col].isin(value_set)
-        invalid_count = int(invalid_mask.sum())
+        non_null = df[col].notna()  # GE semantics: nulls excluded
+        total = int(non_null.sum())
+        invalid_count = int((~df.loc[non_null, col].isin(value_set)).sum())
         valid_pct = (total - invalid_count) / total if total > 0 else 1.0
         return ExpectationResult(
             expectation_type="expect_column_values_to_be_in_set",
@@ -537,9 +603,11 @@ class DataQualityFramework:
         min_val = kwargs.get("min_value")
         max_val = kwargs.get("max_value")
         mostly = kwargs.get("mostly", 1.0)
-        total = len(df)
-        series = pd.to_numeric(df[col], errors="coerce")
-        mask = pd.Series([True] * total, index=df.index)
+        # GE semantics: nulls are excluded from evaluation entirely
+        non_null = df[col].notna()
+        total = int(non_null.sum())
+        series = pd.to_numeric(df.loc[non_null, col], errors="coerce")
+        mask = pd.Series(True, index=series.index)
         if min_val is not None:
             mask &= series >= min_val
         if max_val is not None:
@@ -550,7 +618,10 @@ class DataQualityFramework:
             expectation_type="expect_column_values_to_be_between",
             column=col,
             success=valid_pct >= mostly,
-            observed_value={"min": float(series.min()), "max": float(series.max())},
+            observed_value={
+                "min": float(series.min()) if len(series) else None,
+                "max": float(series.max()) if len(series) else None,
+            },
             element_count=total,
             unexpected_count=invalid_count,
             unexpected_percent=(invalid_count / total * 100) if total > 0 else 0.0,
@@ -560,8 +631,9 @@ class DataQualityFramework:
         col = kwargs["column"]
         regex = kwargs["regex"]
         mostly = kwargs.get("mostly", 1.0)
-        total = len(df)
-        match_mask = df[col].astype(str).str.match(regex, na=False)
+        non_null_str = df[col].dropna().astype(str)  # GE semantics: nulls excluded
+        total = len(non_null_str)
+        match_mask = non_null_str.str.match(regex, na=False)
         invalid_count = int((~match_mask).sum())
         valid_pct = (total - invalid_count) / total if total > 0 else 1.0
         return ExpectationResult(
