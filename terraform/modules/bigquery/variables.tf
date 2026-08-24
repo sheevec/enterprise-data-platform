@@ -7,8 +7,8 @@ variable "environment" {
 }
 
 variable "location" {
-  type        = string
-  default     = "US"
+  type    = string
+  default = "US"
 }
 
 variable "datasets" {

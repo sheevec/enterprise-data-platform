@@ -16,7 +16,7 @@ import pathlib
 
 import pytest
 
-DAGS_DIR = pathlib.Path(__file__).resolve().parents[2] / "airflow" / "dags"
+DAGS_DIR = pathlib.Path(__file__).resolve().parents[2] / "airflow_dags" / "dags"
 
 EXPECTED_DAG_IDS = {"edp_silver_hourly", "edp_maintenance_nightly", "edp_backfill_manual"}
 

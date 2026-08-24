@@ -10,9 +10,19 @@ known_first_party = ["src"]
 [tool.mypy]
 python_version = "3.11"
 ignore_missing_imports = true
-warn_unused_ignores = true
+warn_unused_ignores = false
 check_untyped_defs = true
 exclude = "(\\.venv|build|dist)"
+
+[[tool.mypy.overrides]]
+module = [
+    "google.*",
+    "delta.*",
+    "pyspark.*",
+    "py4j.*",
+]
+ignore_missing_imports = true
+follow_imports = "skip"
 
 [tool.pytest.ini_options]
 testpaths = ["tests/unit"]

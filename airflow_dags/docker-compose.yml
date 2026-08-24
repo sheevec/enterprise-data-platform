@@ -16,7 +16,7 @@ x-airflow-common: &airflow-common
     PYSPARK_PYTHON: python3
   volumes:
     - ../src:/opt/airflow/src
-    - ./dags:/opt/airflow/airflow/dags
+    - ../airflow_dags/dags:/opt/airflow/airflow/dags
     - ../requirements.txt:/opt/airflow/requirements.txt
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on: &airflow-common-depends-on

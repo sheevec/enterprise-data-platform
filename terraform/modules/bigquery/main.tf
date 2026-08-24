@@ -18,7 +18,7 @@ resource "google_bigquery_dataset" "this" {
   project                    = var.project_id
   dataset_id                 = "${each.value.dataset_id}_${var.environment}"
   location                   = var.location
-  delete_contents_on_destroy = false   # never nuke data via terraform destroy
+  delete_contents_on_destroy = false # never nuke data via terraform destroy
 
   default_table_expiration_ms = each.value.default_table_expiration_days != null ? (
     each.value.default_table_expiration_days * 86400000

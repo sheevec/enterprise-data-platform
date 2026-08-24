@@ -5,11 +5,11 @@ import sys
 
 import pytest
 
-spark_session = pytest.importorskip("pyspark.sql")
-
 
 @pytest.fixture(scope="session")
 def spark():
+    # absent pkg skips tests gracefully instead of breaking collection
+    pytest.importorskip("pyspark.sql")
     from pyspark.sql import SparkSession
 
     # Workers must use THIS interpreter: bare `python3` from PATH may be a

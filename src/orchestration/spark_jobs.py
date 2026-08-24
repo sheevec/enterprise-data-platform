@@ -192,7 +192,7 @@ def _lazy_monitor():
 
 
 # ---------------------------------------------------------------------------
-# Concrete task callables (wired into airflow/dags/*.py)
+# Concrete task callables (wired into airflow_dags/dags/*.py)
 # ---------------------------------------------------------------------------
 
 

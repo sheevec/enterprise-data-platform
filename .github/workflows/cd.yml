@@ -58,7 +58,7 @@ jobs:
       - name: Sync DAGs to Composer bucket (plan-first)
         if: ${{ inputs.sync_dags }}
         run: |
-          echo "gsutil -m rsync -r -d airflow/dags gs://${{ vars.COMPOSER_DAGS_BUCKET }}/dags"
+          echo "gsutil -m rsync -r -d airflow_dags/dags gs://${{ vars.COMPOSER_DAGS_BUCKET }}/dags"
           echo ">> dry-run shown above; wire real rsync after bucket provisioning"
 
   release-tag:

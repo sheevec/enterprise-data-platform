@@ -18,7 +18,7 @@ Every component below is implemented, typed (mypy strict-clean), linted, and cov
 | Distributed DQ | `src/validation/distributed_dq.py` | N expectations → ONE aggregate pass over the FULL table; GE null semantics; parity-tested vs pandas engine; violation extraction |
 | DQ framework | `src/validation/data_quality.py` | tiered thresholds/severities; HTML+JSON reports (GCS-durable); Slack/PagerDuty routing; BQ score history |
 | Observability | `src/observability/pipeline_monitor.py` | run metrics lifecycle in BQ; z-score volume/duration anomalies; freshness SLA sweeps; stale-run reconciliation |
-| Orchestration | `airflow/dags/` | hourly silver pipeline w/ DQ promotion gate; nightly maintenance in off-peak window; parametrized manual backfill; every task booked into PipelineMonitor |
+| Orchestration | `airflow_dags/dags/` | hourly silver pipeline w/ DQ promotion gate; nightly maintenance in off-peak window; parametrized manual backfill; every task booked into PipelineMonitor |
 | PII protection | `src/processing/pii_masking.py` | tokenize (HMAC, join-preserving) / mask_full / last4 / drop; pandas + native-Spark paths; identifier-injection guard |
 | GDPR erasure | `src/governance/gdpr_erasure.py` | cross-layer Delta DELETE propagation; operation-metrics capture; immutable JSONL audit trail |
 | Infrastructure | `terraform/` | least-privilege per-workload SAs (impersonation, no keys); GCS versioning/lifecycle/UBLA/public-prevention; BQ dataset containers |
@@ -105,7 +105,7 @@ The Airflow silver DAG enforces this as a **promotion gate**: P1 failures block 
 
 Task callables live Airflow-free in `src/orchestration/spark_jobs.py` and are wrapped by `monitored()` — every execution books start/end rows into PipelineMonitor, feeding the same anomaly detection as Spark jobs.
 
-Backfill safety model, verification SQL, and rollback procedure: [`airflow/runbooks/BACKFILL_RUNBOOK.md`](airflow/runbooks/BACKFILL_RUNBOOK.md).
+Backfill safety model, verification SQL, and rollback procedure: [`airflow_dags/runbooks/BACKFILL_RUNBOOK.md`](airflow_dags/runbooks/BACKFILL_RUNBOOK.md).
 
 ---
 
@@ -168,7 +168,7 @@ enterprise-data-platform/
 │   ├── maintenance/
 │   │   └── table_optimization.py    # OPTIMIZE/Z-ORDER/VACUUM runner
 │   └── utils/config.py              # env parsing helpers
-├── airflow/
+├── airflow_dags/
 │   ├── dags/                        # edp_silver_hourly / maintenance / backfill
 │   ├── docker-compose.yml           # local Airflow 2.8 stack
 │   └── runbooks/BACKFILL_RUNBOOK.md

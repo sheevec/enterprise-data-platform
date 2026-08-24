@@ -9,7 +9,7 @@ Trigger with dag_run.conf overrides (all optional):
      "silver_jobs_json": [...],         # restrict to specific entities
      "starting_offsets": "{\"payments\":{\"0\":12345,\"1\":9876}}"}
 
-Safety model (see airflow/runbooks/BACKFILL_RUNBOOK.md):
+Safety model (see airflow_dags/runbooks/BACKFILL_RUNBOOK.md):
   - Idempotent by construction: Delta txnAppId/txnVersion makes replays no-ops;
     SCD2 hash-merge skips unchanged rows. Clearing this task is always safe.
   - max_active_runs=1 + explicit ordering prevents concurrent writes to the

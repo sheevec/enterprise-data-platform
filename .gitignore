@@ -11,10 +11,23 @@ htmlcov/
 dist/
 build/
 
-# Environment / secrets
+# Environment / secrets — NEVER commit these
 .env
-*.tfvars.local
+.env.*
+!.env.example
 service-account-*.json
+credentials*.json
+*.pem
+*.key
+id_rsa*
+*_rsa
+.gcloud/
+.aws/
+
+# Personal / OS artifacts
+.DS_Store
+.DS_Store?
+Thumbs.db
 
 # Terraform
 .terraform/

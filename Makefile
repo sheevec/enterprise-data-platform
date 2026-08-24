@@ -53,6 +53,9 @@ optimize-submit-local:
 coverage:
 	$(VENV)/bin/pytest tests/unit --cov=src --cov-report=term-missing --cov-report=html
 
+airflow-up:
+	docker compose -f airflow_dags/docker-compose.yml up -d
+
 clean:
 	rm -rf .pytest_cache .mypy_cache .coverage htmlcov dist build *.egg-info
 	find . -type d -name "__pycache__" -exec rm -rf {} +

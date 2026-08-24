@@ -22,11 +22,11 @@ variable "environment" {
 
 locals {
   services = {
-    bronze_consumer   = "Bronze Kafka->GCS ingestion (streaming consumer / Spark streaming job)"
-    silver_processor  = "Bronze->Silver Spark MERGE jobs"
-    maintenance       = "OPTIMIZE/Z-ORDER/VACUUM + GDPR erasure runner"
-    airflow           = "Orchestrator submitting Dataproc/K8s jobs"
-    dq_monitor        = "Data quality gate: read tables, write monitoring dataset"
+    bronze_consumer  = "Bronze Kafka->GCS ingestion (streaming consumer / Spark streaming job)"
+    silver_processor = "Bronze->Silver Spark MERGE jobs"
+    maintenance      = "OPTIMIZE/Z-ORDER/VACUUM + GDPR erasure runner"
+    airflow          = "Orchestrator submitting Dataproc/K8s jobs"
+    dq_monitor       = "Data quality gate: read tables, write monitoring dataset"
   }
 }
 
