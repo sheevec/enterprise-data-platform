@@ -23,7 +23,7 @@ import statistics
 import threading
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -47,10 +47,15 @@ class PipelineStatus(str, Enum):
 
 
 class IncidentSeverity(str, Enum):
-    P1 = "P1"   # Critical — page on-call immediately
-    P2 = "P2"   # High — Slack alert, ticket created
-    P3 = "P3"   # Medium — Slack warning only
-    P4 = "P4"   # Low — logged only
+    P1 = "P1"  # Critical — page on-call immediately
+    P2 = "P2"  # High — Slack alert, ticket created
+    P3 = "P3"  # Medium — Slack warning only
+    P4 = "P4"  # Low — logged only
+
+    @property
+    def rank(self) -> int:
+        """Numeric rank for severity comparisons (higher = more severe)."""
+        return {"P4": 1, "P3": 2, "P2": 3, "P1": 4}[self.value]
 
 
 class AnomalyType(str, Enum):
@@ -126,6 +131,8 @@ class MonitorConfig:
     anomaly_z_threshold: float = DEFAULT_ANOMALY_Z_THRESHOLD
     # Number of historical run rows to load for rolling stats
     rolling_window_runs: int = 30
+    # Runs stuck in 'running' status longer than this are reconciled as failed
+    stale_run_minutes: int = 120
 
 
 # ---------------------------------------------------------------------------
@@ -316,21 +323,32 @@ class PipelineMonitor:
 
     def __init__(self, config: MonitorConfig) -> None:
         self._config = config
-        self._bq_client = bigquery.Client(project=config.bq.project)
+        # BQ client is created lazily on first use: constructing a monitor (e.g.
+        # inside unit tests, or before credentials are mounted) must never make
+        # network calls or fail as a side effect of __init__.
+        self._bq_client: Optional[bigquery.Client] = None
         self._sla_index: Dict[str, SLAConfig] = {
-            s.pipeline_name: s for s in config.sla_configs
+            s.pipeline_name: s
+            for s in (SLAConfig(**s) if isinstance(s, dict) else s for s in config.sla_configs)
         }
         # In-memory store of active runs keyed by run_id
         self._active_runs: Dict[str, PipelineRunMetrics] = {}
         self._lock = threading.Lock()
 
-        self._ensure_bq_tables()
         logger.info(
             "PipelineMonitor initialized | project=%s | dataset=%s | slas=%d",
             config.bq.project,
             config.bq.dataset,
             len(self._sla_index),
         )
+
+    @property
+    def bq_client(self) -> bigquery.Client:
+        """Lazily create the BigQuery client and ensure monitoring tables exist."""
+        if self._bq_client is None:
+            self._bq_client = bigquery.Client(project=self._config.bq.project)
+            self._ensure_bq_tables()
+        return self._bq_client
 
     # ------------------------------------------------------------------
     # Public: run lifecycle
@@ -372,6 +390,11 @@ class PipelineMonitor:
 
         with self._lock:
             self._active_runs[run_id] = metrics
+
+        # Persist a 'running' row immediately: if this process dies mid-run,
+        # forensics (and reconcile_stale_runs) can see the orphaned run instead
+        # of it silently vanishing from history.
+        self._write_run_to_bq(metrics)
 
         logger.info(
             "Pipeline run started | run_id=%s | pipeline=%s",
@@ -481,7 +504,8 @@ class PipelineMonitor:
 
         overage_minutes = age_minutes - threshold_minutes
         severity = (
-            IncidentSeverity.P1 if overage_minutes > threshold_minutes * 0.5
+            IncidentSeverity.P1
+            if overage_minutes > threshold_minutes * 0.5
             else IncidentSeverity.P2
         )
 
@@ -521,6 +545,92 @@ class PipelineMonitor:
         )
         return breaches
 
+    def reconcile_stale_runs(self) -> List[AnomalyRecord]:
+        """
+        Find runs stuck in 'running' status beyond stale_run_minutes (typically
+        from crashed worker processes) and reconcile them:
+
+          1. Append a superseding row with status='failed' (latest row per run_id
+             is authoritative, so health dashboards self-correct).
+          2. Emit a P2 pipeline_failure anomaly + incident so the crash is
+             investigated rather than silently forgotten.
+        """
+        table_id = self._config.bq.table_id(self._config.bq.runs_table)
+        cutoff_minutes = int(self._config.stale_run_minutes)
+        query = f"""
+            SELECT run_id, pipeline_name, started_at_utc
+            FROM (
+                SELECT
+                    run_id,
+                    pipeline_name,
+                    started_at_utc,
+                    ROW_NUMBER() OVER (PARTITION BY run_id ORDER BY started_at_utc DESC) AS rn
+                FROM `{table_id}`
+                WHERE TIMESTAMP(started_at_utc)
+                      >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+            )
+            WHERE rn = 1
+              AND status = 'running'
+              AND TIMESTAMP(started_at_utc)
+                  <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {cutoff_minutes} MINUTE)
+            LIMIT 100
+        """
+
+        try:
+            rows = list(self.bq_client.query(query).result())
+        except Exception as exc:
+            logger.error("Stale-run reconciliation query failed: %s", exc)
+            return []
+
+        reconciled: List[AnomalyRecord] = []
+        detected_at = datetime.now(timezone.utc).isoformat()
+        for row in rows:
+            metrics = PipelineRunMetrics(
+                run_id=row["run_id"],
+                pipeline_name=row["pipeline_name"],
+                dag_id=None,
+                started_at_utc=str(row["started_at_utc"]),
+                ended_at_utc=detected_at,
+                duration_seconds=None,
+                status=PipelineStatus.FAILED,
+                rows_read=0,
+                rows_written=0,
+                rows_errored=0,
+                error_message=(
+                    f"Reconciled as FAILED by PipelineMonitor: no completion event "
+                    f"within {cutoff_minutes} minutes of start."
+                ),
+                source_table=None,
+                target_table=None,
+                spark_job_id=None,
+            )
+            self._write_run_to_bq(metrics)
+
+            anomaly = AnomalyRecord(
+                anomaly_id=str(uuid.uuid4()),
+                pipeline_name=row["pipeline_name"],
+                run_id=row["run_id"],
+                anomaly_type=AnomalyType.PIPELINE_FAILURE,
+                detected_at_utc=detected_at,
+                severity=IncidentSeverity.P2,
+                observed_value=float(cutoff_minutes),
+                expected_value=0.0,
+                z_score=None,
+                description=(
+                    f"Run '{row['run_id']}' of pipeline '{row['pipeline_name']}' was "
+                    f"stuck in 'running' for over {cutoff_minutes} minutes and has "
+                    f"been reconciled as failed (likely a crashed worker process)."
+                ),
+            )
+            self._write_anomaly_to_bq(anomaly)
+            if anomaly.severity.rank >= self._config.alert.slack_min_severity.rank:
+                self._fire_incident(anomaly, metrics=None)
+            reconciled.append(anomaly)
+
+        if reconciled:
+            logger.warning("Reconciled %d stale runs as failed", len(reconciled))
+        return reconciled
+
     def get_pipeline_health_summary(self, pipeline_name: str, hours: int = 24) -> Dict[str, Any]:
         """
         Return a summary of pipeline health over the last N hours.
@@ -540,7 +650,9 @@ class PipelineMonitor:
             FROM `{runs_table}`
             WHERE
                 pipeline_name = @pipeline_name
-                AND TIMESTAMP(started_at_utc) >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {hours} HOUR)
+                AND TIMESTAMP(started_at_utc) >=
+                    TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {hours} HOUR)
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY run_id ORDER BY started_at_utc DESC) = 1
         """
         anomalies_query = f"""
             SELECT
@@ -551,7 +663,8 @@ class PipelineMonitor:
             FROM `{anomalies_table}`
             WHERE
                 pipeline_name = @pipeline_name
-                AND TIMESTAMP(detected_at_utc) >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {hours} HOUR)
+                AND TIMESTAMP(detected_at_utc) >=
+                    TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {hours} HOUR)
             ORDER BY detected_at_utc DESC
             LIMIT 10
         """
@@ -560,7 +673,7 @@ class PipelineMonitor:
 
         try:
             runs_result = (
-                self._bq_client.query(
+                self.bq_client.query(
                     runs_query, job_config=bigquery.QueryJobConfig(query_parameters=params)
                 )
                 .result()
@@ -568,7 +681,7 @@ class PipelineMonitor:
                 .to_dict(orient="records")
             )
             anomalies_result = (
-                self._bq_client.query(
+                self.bq_client.query(
                     anomalies_query, job_config=bigquery.QueryJobConfig(query_parameters=params)
                 )
                 .result()
@@ -581,9 +694,7 @@ class PipelineMonitor:
 
         run_stats = runs_result[0] if runs_result else {}
         total = run_stats.get("total_runs", 0)
-        success_rate = (
-            run_stats.get("successful_runs", 0) / total if total > 0 else None
-        )
+        success_rate = run_stats.get("successful_runs", 0) / total if total > 0 else None
 
         return {
             "pipeline_name": pipeline_name,
@@ -711,18 +822,21 @@ class PipelineMonitor:
         current = float(metrics.rows_written)
         is_anomalous, z_score = stats.is_anomalous(current, self._config.anomaly_z_threshold)
 
-        if not is_anomalous:
+        if not is_anomalous or z_score is None:
             return None
 
-        anomaly_type = (
-            AnomalyType.VOLUME_DROP if z_score < 0 else AnomalyType.VOLUME_SPIKE
-        )
+        mean = stats.mean
+        stdev = stats.stdev
+        if mean is None or stdev is None:
+            return None
+
+        anomaly_type = AnomalyType.VOLUME_DROP if z_score < 0 else AnomalyType.VOLUME_SPIKE
         severity = IncidentSeverity.P1 if abs(z_score) > 5.0 else IncidentSeverity.P2
 
         description = (
             f"Volume anomaly detected for '{metrics.pipeline_name}': "
             f"rows_written={current:,.0f} "
-            f"(rolling_mean={stats.mean:,.0f}, stdev={stats.stdev:,.0f}, z={z_score:.2f}). "
+            f"(rolling_mean={mean:,.0f}, stdev={stdev:,.0f}, z={z_score:.2f}). "
             f"Type: {anomaly_type.value}."
         )
         logger.warning(description)
@@ -735,7 +849,7 @@ class PipelineMonitor:
             detected_at_utc=detected_at,
             severity=severity,
             observed_value=current,
-            expected_value=round(stats.mean, 2),
+            expected_value=round(mean, 2),
             z_score=round(z_score, 4),
             description=description,
         )
@@ -757,8 +871,12 @@ class PipelineMonitor:
         current = metrics.duration_seconds
         is_anomalous, z_score = stats.is_anomalous(current, self._config.anomaly_z_threshold)
 
-        if not is_anomalous or z_score <= 0:
+        if not is_anomalous or z_score is None or z_score <= 0:
             # Only flag duration spikes (slow runs), not unusually fast runs
+            return None
+
+        mean = stats.mean
+        if mean is None:
             return None
 
         severity = IncidentSeverity.P1 if abs(z_score) > 5.0 else IncidentSeverity.P2
@@ -766,7 +884,7 @@ class PipelineMonitor:
         description = (
             f"Duration anomaly for '{metrics.pipeline_name}': "
             f"duration={current:.1f}s "
-            f"(rolling_mean={stats.mean:.1f}s, stdev={stats.stdev:.1f}s, z={z_score:.2f})."
+            f"(rolling_mean={mean:.1f}s, stdev={stats.stdev:.1f}s, z={z_score:.2f})."
         )
         logger.warning(description)
 
@@ -778,7 +896,7 @@ class PipelineMonitor:
             detected_at_utc=detected_at,
             severity=severity,
             observed_value=round(current, 2),
-            expected_value=round(stats.mean, 2),
+            expected_value=round(mean, 2),
             z_score=round(z_score, 4),
             description=description,
         )
@@ -803,16 +921,13 @@ class PipelineMonitor:
         slack_status_code: Optional[int] = None
 
         # PagerDuty
-        if (
-            alert_cfg.pagerduty_routing_key
-            and anomaly.severity == IncidentSeverity.P1
-        ):
+        if alert_cfg.pagerduty_routing_key and anomaly.severity == IncidentSeverity.P1:
             pd_dedup_key, pd_status_code = self._page_pagerduty(anomaly, title, metrics)
 
         # Slack
         if (
             alert_cfg.slack_webhook_url
-            and anomaly.severity.value <= alert_cfg.slack_min_severity.value
+            and anomaly.severity.rank >= alert_cfg.slack_min_severity.rank
         ):
             slack_status_code = self._notify_slack(anomaly, title, metrics)
 
@@ -896,6 +1011,10 @@ class PipelineMonitor:
         metrics: Optional[PipelineRunMetrics],
     ) -> int:
         """Send a Slack notification. Returns the HTTP status code."""
+        webhook_url = self._config.alert.slack_webhook_url
+        if not webhook_url:
+            return -1
+
         severity_emoji = {
             IncidentSeverity.P1: ":red_circle:",
             IncidentSeverity.P2: ":large_yellow_circle:",
@@ -943,7 +1062,7 @@ class PipelineMonitor:
 
         try:
             response = requests.post(
-                self._config.alert.slack_webhook_url,
+                webhook_url,
                 json=payload,
                 timeout=10,
             )
@@ -974,7 +1093,7 @@ class PipelineMonitor:
         """
         try:
             rows = list(
-                self._bq_client.query(
+                self.bq_client.query(
                     query,
                     job_config=bigquery.QueryJobConfig(
                         query_parameters=[
@@ -1023,12 +1142,10 @@ class PipelineMonitor:
         """
         return self._query_float_column(query, pipeline_name, "duration_seconds")
 
-    def _query_float_column(
-        self, query: str, pipeline_name: str, column: str
-    ) -> List[float]:
+    def _query_float_column(self, query: str, pipeline_name: str, column: str) -> List[float]:
         try:
             rows = list(
-                self._bq_client.query(
+                self.bq_client.query(
                     query,
                     job_config=bigquery.QueryJobConfig(
                         query_parameters=[
@@ -1039,32 +1156,52 @@ class PipelineMonitor:
             )
             return [float(row[column]) for row in rows if row[column] is not None]
         except Exception as exc:
-            logger.error(
-                "Failed to query historical %s for %s: %s", column, pipeline_name, exc
-            )
+            logger.error("Failed to query historical %s for %s: %s", column, pipeline_name, exc)
             return []
 
     # ------------------------------------------------------------------
-    # Internal: BigQuery writes
+    # Internal: BigQuery writes (never raise — observability must not
+    # take down the pipelines it monitors)
     # ------------------------------------------------------------------
 
     def _write_run_to_bq(self, metrics: PipelineRunMetrics) -> None:
         table_id = self._config.bq.table_id(self._config.bq.runs_table)
-        errors = self._bq_client.insert_rows_json(table_id, [metrics.to_bq_row()])
-        if errors:
-            logger.error("BQ insert errors for run %s: %s", metrics.run_id, errors)
+        try:
+            errors = self.bq_client.insert_rows_json(table_id, [metrics.to_bq_row()])
+            if errors:
+                logger.error("BQ insert errors for run %s: %s", metrics.run_id, errors)
+        except Exception as exc:
+            logger.error(
+                "Failed to persist run metrics | run_id=%s | error=%s",
+                metrics.run_id,
+                exc,
+            )
 
     def _write_anomaly_to_bq(self, anomaly: AnomalyRecord) -> None:
         table_id = self._config.bq.table_id(self._config.bq.anomalies_table)
-        errors = self._bq_client.insert_rows_json(table_id, [anomaly.to_bq_row()])
-        if errors:
-            logger.error("BQ insert errors for anomaly %s: %s", anomaly.anomaly_id, errors)
+        try:
+            errors = self.bq_client.insert_rows_json(table_id, [anomaly.to_bq_row()])
+            if errors:
+                logger.error("BQ insert errors for anomaly %s: %s", anomaly.anomaly_id, errors)
+        except Exception as exc:
+            logger.error(
+                "Failed to persist anomaly | anomaly_id=%s | error=%s",
+                anomaly.anomaly_id,
+                exc,
+            )
 
     def _write_incident_to_bq(self, incident: IncidentRecord) -> None:
         table_id = self._config.bq.table_id(self._config.bq.incidents_table)
-        errors = self._bq_client.insert_rows_json(table_id, [incident.to_bq_row()])
-        if errors:
-            logger.error("BQ insert errors for incident %s: %s", incident.incident_id, errors)
+        try:
+            errors = self.bq_client.insert_rows_json(table_id, [incident.to_bq_row()])
+            if errors:
+                logger.error("BQ insert errors for incident %s: %s", incident.incident_id, errors)
+        except Exception as exc:
+            logger.error(
+                "Failed to persist incident | incident_id=%s | error=%s",
+                incident.incident_id,
+                exc,
+            )
 
     # ------------------------------------------------------------------
     # Internal: BigQuery table initialization
@@ -1101,7 +1238,7 @@ class PipelineMonitor:
             field=partition_field,
         )
         try:
-            self._bq_client.create_table(table, exists_ok=True)
+            self.bq_client.create_table(table, exists_ok=True)
             logger.info("BigQuery table ready: %s", table_id)
         except Exception as exc:
             logger.error("Failed to create table %s: %s", table_id, exc)
@@ -1177,6 +1314,7 @@ def build_monitor_from_env() -> PipelineMonitor:
         MONITOR_SLACK_URL     — Slack webhook URL
         MONITOR_SLA_JSON      — JSON list of SLAConfig dicts
         MONITOR_Z_THRESHOLD   — Z-score anomaly threshold (default: 3.0)
+        MONITOR_STALE_RUN_MINUTES — reconcile threshold for stuck runs (default: 120)
     """
     bq_project = os.environ["MONITOR_BQ_PROJECT"]
     bq_dataset = os.environ["MONITOR_BQ_DATASET"]
@@ -1191,6 +1329,9 @@ def build_monitor_from_env() -> PipelineMonitor:
             pagerduty_routing_key=os.getenv("MONITOR_PD_KEY"),
             slack_webhook_url=os.getenv("MONITOR_SLACK_URL"),
         ),
-        anomaly_z_threshold=float(os.getenv("MONITOR_Z_THRESHOLD", str(DEFAULT_ANOMALY_Z_THRESHOLD))),
+        anomaly_z_threshold=float(
+            os.getenv("MONITOR_Z_THRESHOLD", str(DEFAULT_ANOMALY_Z_THRESHOLD))
+        ),
+        stale_run_minutes=int(os.getenv("MONITOR_STALE_RUN_MINUTES", "120")),
     )
     return PipelineMonitor(config)

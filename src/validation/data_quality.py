@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
 import requests
@@ -44,9 +44,14 @@ class DataLayer(str, Enum):
 
 
 class AlertSeverity(str, Enum):
-    P1 = "P1"   # Critical — blocks pipeline promotion
-    P2 = "P2"   # High — fires alert, allows promotion with flag
-    P3 = "P3"   # Medium — logged only
+    P1 = "P1"  # Critical — blocks pipeline promotion
+    P2 = "P2"  # High — fires alert, allows promotion with flag
+    P3 = "P3"  # Medium — logged only
+
+    @property
+    def rank(self) -> int:
+        """Numeric rank for severity comparisons (higher = more severe)."""
+        return {"P3": 1, "P2": 2, "P1": 3}[self.value]
 
 
 # Default quality thresholds per layer (fraction of expectations that must pass)
@@ -93,8 +98,8 @@ class SuiteConfig:
 
     suite_name: str
     layer: DataLayer
-    dataset_name: str            # Human-readable name, e.g. "payments_raw"
-    suite_path: Optional[str] = None   # Local JSON file path (overrides default lookup)
+    dataset_name: str  # Human-readable name, e.g. "payments_raw"
+    suite_path: Optional[str] = None  # Local JSON file path (overrides default lookup)
     threshold_override: Optional[float] = None  # Per-suite threshold override
 
     @property
@@ -106,13 +111,16 @@ class SuiteConfig:
 class DataQualityConfig:
     """Top-level configuration for DataQualityFramework."""
 
-    suites_dir: str                    # Directory containing expectation suite JSON files
+    suites_dir: str  # Directory containing expectation suite JSON files
     alert: AlertConfig = field(default_factory=AlertConfig)
     bq_monitoring: Optional[BigQueryMonitoringConfig] = None
     # If True, raise an exception when quality drops below threshold
     raise_on_failure: bool = True
-    # Base path for HTML report output (local or GCS path)
+    # Base path for local report output (always written; durable copy goes to GCS if configured)
     reports_output_dir: str = "/tmp/dq_reports"
+    # Optional GCS bucket for durable report storage (e.g. "edp-dq-reports").
+    # Local /tmp reports are ephemeral — container restarts lose them.
+    reports_gcs_bucket: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -146,13 +154,14 @@ class ValidationResult:
     total_expectations: int
     passed_expectations: int
     failed_expectations: int
-    data_quality_score: float            # passed / total, range [0, 1]
+    data_quality_score: float  # passed / total, range [0, 1]
     threshold: float
     passed_threshold: bool
     severity: AlertSeverity
     expectation_results: List[ExpectationResult] = field(default_factory=list)
     row_count: int = 0
     report_path: Optional[str] = None
+    gcs_report_uri: Optional[str] = None
 
     @property
     def summary(self) -> str:
@@ -334,6 +343,7 @@ class DataQualityFramework:
             return None
 
         table_id = self._config.bq_monitoring.full_table_id
+        days = int(days)  # guard against f-string SQL injection via non-int input
         query = f"""
             SELECT
                 evaluated_at_utc,
@@ -345,13 +355,12 @@ class DataQualityFramework:
             FROM `{table_id}`
             WHERE
                 dataset_name = @dataset_name
-                AND TIMESTAMP(evaluated_at_utc) >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {days} DAY)
+                AND TIMESTAMP(evaluated_at_utc) >=
+                    TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {days} DAY)
             ORDER BY evaluated_at_utc DESC
         """
         job_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("dataset_name", "STRING", dataset_name)
-            ]
+            query_parameters=[bigquery.ScalarQueryParameter("dataset_name", "STRING", dataset_name)]
         )
         logger.info("Fetching DQS history | dataset=%s | days=%d", dataset_name, days)
         return self._bq_client.query(query, job_config=job_config).to_dataframe()
@@ -386,7 +395,11 @@ class DataQualityFramework:
             suite = json.load(fh)
 
         self._suite_cache[suite_name] = suite
-        logger.info("Loaded expectation suite: %s (%d expectations)", suite_name, len(suite.get("expectations", [])))
+        logger.info(
+            "Loaded expectation suite: %s (%d expectations)",
+            suite_name,
+            len(suite.get("expectations", [])),
+        )
         return suite
 
     # ------------------------------------------------------------------
@@ -625,9 +638,8 @@ class DataQualityFramework:
         min_val = kwargs.get("min_value")
         max_val = kwargs.get("max_value")
         mean_val = float(pd.to_numeric(df[col], errors="coerce").mean())
-        in_range = (
-            (min_val is None or mean_val >= min_val)
-            and (max_val is None or mean_val <= max_val)
+        in_range = (min_val is None or mean_val >= min_val) and (
+            max_val is None or mean_val <= max_val
         )
         return ExpectationResult(
             expectation_type="expect_column_mean_to_be_between",
@@ -644,9 +656,8 @@ class DataQualityFramework:
         min_val = kwargs.get("min_value")
         max_val = kwargs.get("max_value")
         sum_val = float(pd.to_numeric(df[col], errors="coerce").sum())
-        in_range = (
-            (min_val is None or sum_val >= min_val)
-            and (max_val is None or sum_val <= max_val)
+        in_range = (min_val is None or sum_val >= min_val) and (
+            max_val is None or sum_val <= max_val
         )
         return ExpectationResult(
             expectation_type="expect_column_sum_to_be_between",
@@ -682,14 +693,15 @@ class DataQualityFramework:
 
     def _generate_report(self, result: ValidationResult) -> str:
         """
-        Write a JSON validation report to disk and return the file path.
-        In production this would also render an HTML report.
+        Write a JSON validation report locally, render an HTML summary alongside
+        it, and (if configured) copy both to GCS for durable storage.
+        Returns the local JSON file path; the GCS URI lands in result.details
+        and the BigQuery monitoring row.
         """
         output_dir = Path(self._config.reports_output_dir)
-        report_filename = (
-            f"{result.dataset_name}_{result.suite_name}_{result.run_id[:8]}.json"
-        )
-        report_path = output_dir / report_filename
+        base_filename = f"{result.dataset_name}_{result.suite_name}_{result.run_id[:8]}"
+        json_path = output_dir / f"{base_filename}.json"
+        html_path = output_dir / f"{base_filename}.html"
 
         report_data = {
             "run_id": result.run_id,
@@ -705,6 +717,7 @@ class DataQualityFramework:
             "total_expectations": result.total_expectations,
             "passed_expectations": result.passed_expectations,
             "failed_expectations": result.failed_expectations,
+            "gcs_report_uri": result.gcs_report_uri,
             "expectation_results": [
                 {
                     "expectation_type": r.expectation_type,
@@ -718,11 +731,91 @@ class DataQualityFramework:
             ],
         }
 
-        with report_path.open("w", encoding="utf-8") as fh:
+        with json_path.open("w", encoding="utf-8") as fh:
             json.dump(report_data, fh, indent=2)
 
-        logger.info("Validation report written to: %s", report_path)
-        return str(report_path)
+        html_path.write_text(self._render_html_report(result), encoding="utf-8")
+
+        logger.info("Validation reports written | json=%s | html=%s", json_path, html_path)
+
+        if self._config.reports_gcs_bucket:
+            gcs_uri = self._upload_reports_to_gcs([json_path, html_path], result.run_id)
+            if gcs_uri:
+                result.gcs_report_uri = gcs_uri
+
+        return str(json_path)
+
+    @staticmethod
+    def _render_html_report(result: ValidationResult) -> str:
+        """Render a minimal standalone HTML validation summary."""
+        status_color = "#1a7f37" if result.passed_threshold else "#cf222e"
+
+        def _fmt_unexpected_pct(value: Optional[float]) -> str:
+            return "" if value is None else f"{round(value, 2)}"
+
+        rows_html = ""
+        for r in result.expectation_results:
+            badge = (
+                '<span style="color:#1a7f37">PASS</span>'
+                if r.success
+                else '<span style="color:#cf222e">FAIL</span>'
+            )
+            rows_html += (
+                "<tr>"
+                f"<td>{r.expectation_type}</td>"
+                f"<td>{r.column or '—'}</td>"
+                f"<td>{badge}</td>"
+                f"<td>{str(r.observed_value)[:80]}</td>"
+                f"<td>{r.unexpected_count}</td>"
+                f"<td>{_fmt_unexpected_pct(r.unexpected_percent)}%</td>"
+                "</tr>"
+            )
+
+        return f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>DQ Report — {result.dataset_name}/{result.suite_name}</title>
+<style>
+body {{ font-family: -apple-system, sans-serif; margin: 2rem; }}
+table {{ border-collapse: collapse; width: 100%; margin-top: 1rem; }}
+th, td {{ border: 1px solid #d0d7de; padding: 6px 10px; text-align: left; font-size: 14px; }}
+th {{ background: #f6f8fa; }}
+h1 span {{ color: {status_color}; }}
+</style></head>
+<body>
+<h1>Data Quality Report — <span>{'PASS' if result.passed_threshold else 'FAIL'}</span></h1>
+<p>
+<b>Dataset:</b> {result.dataset_name} &nbsp;|&nbsp;
+<b>Suite:</b> {result.suite_name} &nbsp;|&nbsp;
+<b>Layer:</b> {result.layer.value.upper()} &nbsp;|&nbsp;
+<b>DQS:</b> {result.data_quality_score:.2%} (threshold {result.threshold:.2%})<br>
+<b>Rows:</b> {result.row_count:,} &nbsp;|&nbsp;
+<b>Expectations:</b> {result.passed_expectations}/{result.total_expectations} passed &nbsp;|&nbsp;
+<b>Run ID:</b> <code>{result.run_id}</code><br>
+<b>Evaluated:</b> {result.evaluated_at_utc}
+</p>
+<table>
+<tr><th>Expectation</th><th>Column</th><th>Status</th><th>Observed</th><th>Unexpected</th><th>%</th></tr>
+{rows_html}
+</table>
+</body>
+</html>"""
+
+    def _upload_reports_to_gcs(self, local_paths: List[Path], run_id: str) -> Optional[str]:
+        """Upload report artifacts to GCS under runs/{run_id}/. Returns the folder URI."""
+        try:
+            from google.cloud import storage
+
+            client = storage.Client()
+            bucket = client.bucket(self._config.reports_gcs_bucket)
+            for lp in local_paths:
+                blob = bucket.blob(f"runs/{run_id}/{lp.name}")
+                blob.upload_from_filename(str(lp))
+            uri = f"gs://{self._config.reports_gcs_bucket}/runs/{run_id}/"
+            logger.info("Reports uploaded to GCS: %s", uri)
+            return uri
+        except Exception as exc:
+            logger.error("Failed to upload reports to GCS: %s", exc)
+            return None
 
     # ------------------------------------------------------------------
     # Alerting
@@ -734,19 +827,20 @@ class DataQualityFramework:
 
         if (
             alert_cfg.slack_webhook_url
-            and result.severity.value <= alert_cfg.slack_min_severity.value
+            and result.severity.rank >= alert_cfg.slack_min_severity.rank
         ):
             self._send_slack_alert(result, alert_cfg.slack_webhook_url)
 
-        if (
-            alert_cfg.pagerduty_routing_key
-            and result.severity == AlertSeverity.P1
-        ):
+        if alert_cfg.pagerduty_routing_key and result.severity == AlertSeverity.P1:
             self._send_pagerduty_alert(result, alert_cfg.pagerduty_routing_key)
 
     def _send_slack_alert(self, result: ValidationResult, webhook_url: str) -> None:
         """Post a Slack message summarizing the quality failure."""
-        severity_emoji = {"P1": ":red_circle:", "P2": ":large_yellow_circle:", "P3": ":white_circle:"}
+        severity_emoji = {
+            "P1": ":red_circle:",
+            "P2": ":large_yellow_circle:",
+            "P3": ":white_circle:",
+        }
         emoji = severity_emoji.get(result.severity.value, ":question:")
 
         failed_expectations_text = "\n".join(
@@ -754,7 +848,9 @@ class DataQualityFramework:
             f"— unexpected: {r.unexpected_count} ({r.unexpected_percent:.1f}%)"
             for r in result.expectation_results
             if not r.success
-        )[:2000]  # Slack has a 3000-char limit per block
+        )[
+            :2000
+        ]  # Slack has a 3000-char limit per block
 
         payload = {
             "blocks": [
@@ -786,7 +882,10 @@ class DataQualityFramework:
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"*Failed Expectations ({result.failed_expectations}):*\n{failed_expectations_text}",
+                        "text": (
+                            f"*Failed Expectations ({result.failed_expectations}):*"
+                            f"\n{failed_expectations_text}"
+                        ),
                     },
                 },
             ]
@@ -848,6 +947,8 @@ class DataQualityFramework:
     def _ensure_bq_table_exists(self) -> None:
         """Create the BigQuery DQS tracking table if it does not exist."""
         cfg = self._config.bq_monitoring
+        if cfg is None or self._bq_client is None:
+            return
         schema = [
             bigquery.SchemaField("run_id", "STRING", mode="REQUIRED"),
             bigquery.SchemaField("dataset_name", "STRING", mode="REQUIRED"),
@@ -863,6 +964,7 @@ class DataQualityFramework:
             bigquery.SchemaField("failed_expectations", "INT64", mode="REQUIRED"),
             bigquery.SchemaField("row_count", "INT64", mode="REQUIRED"),
             bigquery.SchemaField("report_path", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("gcs_report_uri", "STRING", mode="NULLABLE"),
         ]
         table_ref = bigquery.Table(cfg.full_table_id, schema=schema)
         table_ref.time_partitioning = bigquery.TimePartitioning(
@@ -877,6 +979,9 @@ class DataQualityFramework:
 
     def _write_dqs_to_bigquery(self, result: ValidationResult) -> None:
         """Insert a single DQS score row into the BigQuery monitoring table."""
+        cfg = self._config.bq_monitoring
+        if cfg is None or self._bq_client is None:
+            return
         row = {
             "run_id": result.run_id,
             "dataset_name": result.dataset_name,
@@ -892,9 +997,9 @@ class DataQualityFramework:
             "failed_expectations": result.failed_expectations,
             "row_count": result.row_count,
             "report_path": result.report_path,
+            "gcs_report_uri": result.gcs_report_uri,
         }
 
-        cfg = self._config.bq_monitoring
         errors = self._bq_client.insert_rows_json(cfg.full_table_id, [row])
         if errors:
             logger.error(
@@ -924,13 +1029,6 @@ class DataQualityError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Type alias for handler callable (used in _dispatch_expectation)
-# ---------------------------------------------------------------------------
-
-from typing import Callable  # noqa: E402  (imported here to avoid circular reference at top)
-
-
-# ---------------------------------------------------------------------------
 # Factory helper
 # ---------------------------------------------------------------------------
 
@@ -948,6 +1046,7 @@ def build_framework_from_env() -> DataQualityFramework:
         DQ_BQ_DATASET          — BigQuery dataset for DQS tracking
         DQ_RAISE_ON_FAILURE    — "true"/"false" (default: "true")
         DQ_REPORTS_DIR         — local path for validation reports
+        DQ_REPORTS_GCS_BUCKET  — GCS bucket for durable report storage
     """
     suites_dir = os.environ["DQ_SUITES_DIR"]
     bq_project = os.getenv("DQ_BQ_PROJECT")
@@ -966,5 +1065,6 @@ def build_framework_from_env() -> DataQualityFramework:
         bq_monitoring=bq_cfg,
         raise_on_failure=os.getenv("DQ_RAISE_ON_FAILURE", "true").lower() == "true",
         reports_output_dir=os.getenv("DQ_REPORTS_DIR", "/tmp/dq_reports"),
+        reports_gcs_bucket=os.getenv("DQ_REPORTS_GCS_BUCKET") or None,
     )
     return DataQualityFramework(config)

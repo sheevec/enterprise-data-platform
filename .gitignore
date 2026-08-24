@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Environment / secrets
+.env
+*.tfvars.local
+service-account-*.json
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate*
+crash.log
+
+# Airflow / dbt
+logs/
+dbt/logs/
+dbt/target/
+airflow.db*
+
+# Data quality reports (local scratch)
+tmp/
+dq_reports/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

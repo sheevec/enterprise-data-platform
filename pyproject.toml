@@ -1,0 +1,19 @@
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+known_first_party = ["src"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
+check_untyped_defs = true
+exclude = "(\\.venv|build|dist)"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit"]
+addopts = "-q"

@@ -18,7 +18,7 @@ dbt-bigquery==1.7.0
 dbt-core==1.7.0               # pulled transitively by dbt-bigquery; pinned for reproducibility
 
 # ── Streaming / Messaging ─────────────────────────────────────────────────────
-kafka-python==2.0.2
+confluent-kafka==2.3.0        # librdkafka bindings — required for production throughput
 fastavro==1.9.0               # Avro serialization/deserialization (Schema Registry wire format)
 
 # ── Data Quality ──────────────────────────────────────────────────────────────
