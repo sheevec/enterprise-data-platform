@@ -133,6 +133,9 @@ class MonitorConfig:
     rolling_window_runs: int = 30
     # Runs stuck in 'running' status longer than this are reconciled as failed
     stale_run_minutes: int = 120
+    # Seasonal robust baselines (median+MAD over day/hour buckets) instead of
+    # plain global z-score — eliminates daily/weekly cycle false-positives.
+    anomaly_use_seasonality: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -818,25 +821,38 @@ class PipelineMonitor:
             )
             return None
 
-        stats = RollingStats(history)
         current = float(metrics.rows_written)
-        is_anomalous, z_score = stats.is_anomalous(current, self._config.anomaly_z_threshold)
+        values = [v for _, v in history]
+
+        if self._config.anomaly_use_seasonality:
+            from src.observability.baselines import SeasonalBaseline
+
+            baseline = SeasonalBaseline(history)
+            is_anomalous, score = baseline.is_anomalous(current)
+            z_score: Optional[float] = None if score is None else round(score, 4)
+            method = "seasonal_mad"
+        else:
+            stats = RollingStats(values)
+            is_anomalous, raw_z = stats.is_anomalous(current, self._config.anomaly_z_threshold)
+            z_score = None if raw_z is None else round(raw_z, 4)
+            method = "global_zscore"
 
         if not is_anomalous or z_score is None:
             return None
 
-        mean = stats.mean
-        stdev = stats.stdev
-        if mean is None or stdev is None:
+        baseline_median: Optional[float] = (
+            statistics.median(values) if method == "seasonal_mad" else RollingStats(values).mean
+        )
+        if baseline_median is None:
             return None
-
+        mean_for_desc = baseline_median
         anomaly_type = AnomalyType.VOLUME_DROP if z_score < 0 else AnomalyType.VOLUME_SPIKE
         severity = IncidentSeverity.P1 if abs(z_score) > 5.0 else IncidentSeverity.P2
 
         description = (
-            f"Volume anomaly detected for '{metrics.pipeline_name}': "
+            f"Volume anomaly ({method}) detected for '{metrics.pipeline_name}': "
             f"rows_written={current:,.0f} "
-            f"(rolling_mean={mean:,.0f}, stdev={stdev:,.0f}, z={z_score:.2f}). "
+            f"(baseline_median={mean_for_desc:,.0f}, score={z_score:.2f}). "
             f"Type: {anomaly_type.value}."
         )
         logger.warning(description)
@@ -849,8 +865,8 @@ class PipelineMonitor:
             detected_at_utc=detected_at,
             severity=severity,
             observed_value=current,
-            expected_value=round(mean, 2),
-            z_score=round(z_score, 4),
+            expected_value=round(float(mean_for_desc), 2),
+            z_score=z_score,
             description=description,
         )
 
@@ -867,24 +883,36 @@ class PipelineMonitor:
         if len(history) < MIN_HISTORY_FOR_ANOMALY:
             return None
 
-        stats = RollingStats(history)
         current = metrics.duration_seconds
-        is_anomalous, z_score = stats.is_anomalous(current, self._config.anomaly_z_threshold)
+        values = [v for _, v in history]
+
+        if self._config.anomaly_use_seasonality:
+            from src.observability.baselines import SeasonalBaseline
+
+            baseline = SeasonalBaseline(history)
+            is_anomalous, score = baseline.is_anomalous(current)
+            z_score: Optional[float] = None if score is None else round(score, 4)
+            method = "seasonal_mad"
+            baseline_median: Optional[float] = statistics.median(values)
+        else:
+            stats = RollingStats(values)
+            is_anomalous, raw_z = stats.is_anomalous(current, self._config.anomaly_z_threshold)
+            z_score = None if raw_z is None else round(raw_z, 4)
+            method = "global_zscore"
+            baseline_median = stats.mean
 
         if not is_anomalous or z_score is None or z_score <= 0:
             # Only flag duration spikes (slow runs), not unusually fast runs
             return None
-
-        mean = stats.mean
-        if mean is None:
+        if baseline_median is None:
             return None
 
         severity = IncidentSeverity.P1 if abs(z_score) > 5.0 else IncidentSeverity.P2
 
         description = (
-            f"Duration anomaly for '{metrics.pipeline_name}': "
+            f"Duration anomaly ({method}) for '{metrics.pipeline_name}': "
             f"duration={current:.1f}s "
-            f"(rolling_mean={mean:.1f}s, stdev={stats.stdev:.1f}s, z={z_score:.2f})."
+            f"(baseline_median={baseline_median:.1f}s, score={z_score:.2f})."
         )
         logger.warning(description)
 
@@ -896,8 +924,8 @@ class PipelineMonitor:
             detected_at_utc=detected_at,
             severity=severity,
             observed_value=round(current, 2),
-            expected_value=round(mean, 2),
-            z_score=round(z_score, 4),
+            expected_value=round(baseline_median, 2),
+            z_score=z_score,
             description=description,
         )
 
@@ -1112,8 +1140,8 @@ class PipelineMonitor:
             logger.error("Failed to query last success for %s: %s", pipeline_name, exc)
             return None
 
-    def _query_historical_rows(self, pipeline_name: str) -> List[float]:
-        """Return recent rows_written values for anomaly baseline computation."""
+    def _query_historical_rows(self, pipeline_name: str) -> List[Tuple[datetime, float]]:
+        """Recent (started_at_utc, rows_written) pairs for anomaly baselines."""
         table_id = self._config.bq.table_id(self._config.bq.runs_table)
         limit = self._config.rolling_window_runs
         query = f"""
@@ -1125,10 +1153,10 @@ class PipelineMonitor:
             ORDER BY started_at_utc DESC
             LIMIT {limit}
         """
-        return self._query_float_column(query, pipeline_name, "rows_written")
+        return self._query_float_column(query, pipeline_name, ("started_at_utc", "rows_written"))
 
-    def _query_historical_durations(self, pipeline_name: str) -> List[float]:
-        """Return recent duration_seconds values for anomaly baseline computation."""
+    def _query_historical_durations(self, pipeline_name: str) -> List[Tuple[datetime, float]]:
+        """Recent (started_at_utc, duration_seconds) pairs for anomaly baselines."""
         table_id = self._config.bq.table_id(self._config.bq.runs_table)
         limit = self._config.rolling_window_runs
         query = f"""
@@ -1140,9 +1168,13 @@ class PipelineMonitor:
             ORDER BY started_at_utc DESC
             LIMIT {limit}
         """
-        return self._query_float_column(query, pipeline_name, "duration_seconds")
+        return self._query_float_column(
+            query, pipeline_name, ("started_at_utc", "duration_seconds")
+        )
 
-    def _query_float_column(self, query: str, pipeline_name: str, column: str) -> List[float]:
+    def _query_float_column(
+        self, query: str, pipeline_name: str, columns: Tuple[str, ...]
+    ) -> List[Tuple[datetime, float]]:
         try:
             rows = list(
                 self.bq_client.query(
@@ -1154,9 +1186,20 @@ class PipelineMonitor:
                     ),
                 ).result()
             )
-            return [float(row[column]) for row in rows if row[column] is not None]
+            pairs: List[Tuple[datetime, float]] = []
+            for row in rows:
+                value = row[columns[1]]
+                if value is None:
+                    continue
+                ts = row[columns[0]]
+                if isinstance(ts, str):
+                    ts = datetime.fromisoformat(ts)
+                elif ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                pairs.append((ts, float(value)))
+            return pairs
         except Exception as exc:
-            logger.error("Failed to query historical %s for %s: %s", column, pipeline_name, exc)
+            logger.error("Failed to query historical %s for %s: %s", columns[1], pipeline_name, exc)
             return []
 
     # ------------------------------------------------------------------

@@ -875,7 +875,7 @@ h1 span {{ color: {status_color}; }}
     def _upload_reports_to_gcs(self, local_paths: List[Path], run_id: str) -> Optional[str]:
         """Upload report artifacts to GCS under runs/{run_id}/. Returns the folder URI."""
         try:
-            from google.cloud import storage
+            from google.cloud import storage  # type: ignore[attr-defined]
 
             client = storage.Client()
             bucket = client.bucket(self._config.reports_gcs_bucket)

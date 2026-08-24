@@ -1,0 +1,71 @@
+name: cd
+
+# Release engineering skeleton. Every deploy step is GUARDED:
+#   - terraform apply requires a manual environment approval (GitHub
+#     environment protection rules on `prod`) AND explicit workflow choice.
+#   - DAG sync and job deploys are plan-first; nothing auto-runs on merge.
+# Wire the placeholder steps to real infra when environments exist.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Deploy target"
+        required: true
+        type: choice
+        options: [staging, prod]
+      apply_terraform:
+        description: "Apply Terraform (needs environment approval)"
+        required: true
+        type: boolean
+        default: false
+      sync_dags:
+        description: "Sync Airflow DAGs to Composer bucket"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write   # Workload Identity federation — no long-lived keys
+
+concurrency:
+  group: cd-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.target }}   # protection rules gate here
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Auth to GCP via Workload Identity
+        if: ${{ inputs.apply_terraform || inputs.sync_dags }}
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - name: Terraform apply (guarded)
+        if: ${{ inputs.apply_terraform }}
+        working-directory: terraform
+        run: |
+          terraform init -backend=false
+          terraform plan  -var-file=environments/${{ inputs.target }}/terraform.tfvars
+          terraform apply -var-file=environments/${{ inputs.target }}/terraform.tfvars -auto-approve
+
+      - name: Sync DAGs to Composer bucket (plan-first)
+        if: ${{ inputs.sync_dags }}
+        run: |
+          echo "gsutil -m rsync -r -d airflow/dags gs://${{ vars.COMPOSER_DAGS_BUCKET }}/dags"
+          echo ">> dry-run shown above; wire real rsync after bucket provisioning"
+
+  release-tag:
+    # Tag convention: vX.Y.Z on main. Changelog must have an entry.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify CHANGELOG mentions this tag
+        run: grep -q "$(echo ${{ github.ref_name }} | sed 's/^v//')" CHANGELOG.md

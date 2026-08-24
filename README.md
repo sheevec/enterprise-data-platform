@@ -22,8 +22,12 @@ Every component below is implemented, typed (mypy strict-clean), linted, and cov
 | PII protection | `src/processing/pii_masking.py` | tokenize (HMAC, join-preserving) / mask_full / last4 / drop; pandas + native-Spark paths; identifier-injection guard |
 | GDPR erasure | `src/governance/gdpr_erasure.py` | cross-layer Delta DELETE propagation; operation-metrics capture; immutable JSONL audit trail |
 | Infrastructure | `terraform/` | least-privilege per-workload SAs (impersonation, no keys); GCS versioning/lifecycle/UBLA/public-prevention; BQ dataset containers |
+| Prometheus metrics | `src/observability/prometheus_exporter.py` | `edp_consumer_*` counters + per-partition lag gauge; env-gated zero-overhead when off |
+| Anomaly baselines | `src/observability/baselines.py` | median+MAD robust scores over day-of-week/hour buckets; fallback ladder; kills cycle false-positives |
+| Lineage | `src/observability/lineage_tracker.py` | OpenLineage v1 events (start/complete/fail) wired into Silver batches; never raises into the pipeline |
+| CI/CD | `.github/workflows/` | lint · unit+Spark (Java 17) · terraform fmt+validate · Airflow DagBag integrity; CD is WIF-authenticated, environment-gated, plan-first |
 
-**Test suite: 107 passing** (Spark-backed integration included), mypy/flake8/black/isort clean.
+**Test suite: 124 passing** (Spark-backed integration included), mypy/flake8/black/isort clean.
 
 ---
 
@@ -239,9 +243,10 @@ The business case this architecture models, from the reference deployment it rep
 
 ## Roadmap
 
-- [ ] **Phase 7 — Observability depth:** Prometheus/Grafana exporters, seasonal anomaly baselines, OpenLineage column-level lineage, SLO error budgets
+- [x] **Phase 7 — Observability depth:** Prometheus exporters, seasonal robust baselines, OpenLineage emission
+- [x] **Phase 8 — Release engineering:** GitHub Actions CI (lint/test/dag-contract/terraform), guarded CD skeleton, changelog conventions
 - [ ] **Gold layer:** dbt models (domain marts), snapshots for SCD2 dims, slim-CI
-- [ ] **Phase 8 — Release engineering:** GitHub Actions CI (lint/type/test/dag-contract/terraform-plan), staging deploys, canary patterns
+- [ ] Wire lineage/Marquez + Grafana dashboards against provisioned infra
 - [ ] Multi-region DR drills; RTO/RPO validation
 
 ---

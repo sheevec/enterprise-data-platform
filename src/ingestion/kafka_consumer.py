@@ -38,9 +38,10 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from confluent_kafka import Consumer, KafkaError, KafkaException, Message, Producer, TopicPartition
-from google.cloud import storage
+from google.cloud import storage  # type: ignore[attr-defined]
 
 from src.ingestion.schema_registry import SchemaRegistryClient, SchemaRegistryConfig
+from src.observability.prometheus_exporter import ConsumerPrometheusMetrics
 
 __all__ = [
     "SchemaRegistryConfig",
@@ -309,6 +310,8 @@ class _TopicWorker:
         self._metrics = metrics
         self._metrics_lock = metrics_lock
         self._shutdown_event = shutdown_event
+        # Shared process-wide facade (prometheus registry is global anyway)
+        self._prom = ConsumerPrometheusMetrics()
 
         self.batch: List[Dict[str, Any]] = []
         self.pending_offsets: Dict[Tuple[str, int], int] = {}
@@ -466,6 +469,7 @@ class _TopicWorker:
 
             with self._metrics_lock:
                 self._metrics.messages_consumed += 1
+            self._prom.record_consumed(msg.topic())
 
         except Exception as deser_exc:
             logger.warning(
@@ -477,6 +481,7 @@ class _TopicWorker:
             )
             with self._metrics_lock:
                 self._metrics.deserialization_errors += 1
+            self._prom.record_deserialization_error(msg.topic())
             self._send_to_dlq(msg, deser_exc)
             # The failed message itself is skipped; its offset advances with the
             # next successful message from this partition (or on flush).
@@ -549,6 +554,7 @@ class _TopicWorker:
         with self._metrics_lock:
             self._metrics.messages_written_to_gcs += len(self.batch)
             self._metrics.batches_written += 1
+        self._prom.record_batch_written(self.topic_cfg.topic)
 
         logger.debug(
             "Flushed batch | topic=%s | records=%d | file_id=%s",
@@ -594,6 +600,7 @@ class _TopicWorker:
             self.dlq_producer.poll(0)  # serve delivery-report callbacks
             with self._metrics_lock:
                 self._metrics.messages_sent_to_dlq += 1
+            self._prom.record_dlq(msg.topic())
         except BufferError:
             logger.warning("DLQ producer queue full — flushing and retrying once")
             self.dlq_producer.flush(timeout=10)
@@ -653,6 +660,7 @@ class _TopicWorker:
             with self._metrics_lock:
                 self._metrics.consumer_lag = lag_map
                 self._metrics.lag_sampled_at_utc = datetime.now(timezone.utc).isoformat()
+            self._prom.record_lag_snapshot(lag_map)
         except Exception as lag_exc:
             logger.debug("Could not compute consumer lag: %s", lag_exc)
         return lag_map
@@ -689,6 +697,7 @@ class DataPlatformConsumer:
         )
         self._metrics = ConsumerMetrics()
         self._metrics_lock = threading.Lock()
+        self._prom = ConsumerPrometheusMetrics()  # no-op unless METRICS_ENABLED=true
         self._running = False
         self._workers: List[_TopicWorker] = []
         self._threads: List[threading.Thread] = []

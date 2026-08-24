@@ -39,6 +39,7 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
+from src.observability.lineage_tracker import LineageDataset, build_emitter_from_env, new_run_id
 from src.utils.config import get_bool, get_json_list
 
 logger = logging.getLogger(__name__)
@@ -345,11 +346,32 @@ class BronzeToSilverJob:
 
     def _make_batch_handler(self, spec: SilverJobSpec) -> Any:
         quarantine_path = spec.quarantine_path or f"{spec.source_path.rstrip('/')}_quarantine"
+        emitter = build_emitter_from_env()
 
         def handle(batch: DataFrame, batch_id: int) -> None:
-            if batch.rdd.isEmpty():  # cheap existence check
-                return
+            run_id = new_run_id()
+            inputs = [LineageDataset(name=spec.source_path, namespace="edp-gcs")]
+            outputs = [LineageDataset(name=spec.target_path, namespace="edp-gcs")]
+            emitter.emit_start(f"silver.{spec.name}", run_id, inputs, outputs)
+            try:
+                self._process_batch(spec, batch, batch_id, quarantine_path)
+                emitter.emit_complete(f"silver.{spec.name}", run_id, inputs, outputs)
+            except Exception as exc:
+                emitter.emit_fail(
+                    f"silver.{spec.name}",
+                    run_id,
+                    inputs,
+                    outputs,
+                    error_message=f"{type(exc).__name__}: {exc}",
+                )
+                raise
 
+        return handle
+
+    def _process_batch(
+        self, spec: SilverJobSpec, batch: DataFrame, batch_id: int, quarantine_path: str
+    ) -> None:
+        if not batch.rdd.isEmpty():  # cheap existence check
             clean, bad = validate_and_quarantine(batch, spec)
             quarantined = write_quarantine(bad, quarantine_path, batch_id) if bad is not None else 0
 
@@ -368,8 +390,6 @@ class BronzeToSilverJob:
                 quarantined,
                 spec.scd_type,
             )
-
-        return handle
 
 
 # ---------------------------------------------------------------------------
