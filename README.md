@@ -1,6 +1,6 @@
 # Enterprise Data Platform
 
-A production-grade lakehouse platform implementing the Medallion architecture on GCP: distributed streaming ingestion from Kafka, SCD-aware Silver merges on Delta Lake, single-pass distributed data quality, SLA-driven Airflow orchestration, and policy-as-code governance. Built and verified as a portfolio-scale reference implementation of an architecture that runs financial-services workloads at 500TB / 200+ pipelines / 99.9% SLA scale.
+A production-grade lakehouse platform implementing the Medallion architecture on GCP: distributed streaming ingestion from Kafka, SCD-aware Silver merges on Delta Lake, single-pass distributed data quality, SLA-driven Airflow orchestration, and policy-as-code governance. Built and verified as a portfolio-scale reference implementation of an enterprise data layer that moved 10+ TB/day, cut batch latency from hours to minutes and reduced manual data preparation by 40%.
 
 ---
 
@@ -176,7 +176,7 @@ enterprise-data-platform/
 │   ├── main.tf                      # root wiring (env via -var-file)
 │   ├── environments/{staging,prod}/
 │   └── modules/{gcs,bigquery,iam}/
-├── tests/unit/                      # 108 tests incl. local Spark+Delta integration
+├── tests/unit/                      # 124 tests incl. local Spark+Delta integration
 ├── Makefile · pyproject.toml · setup.cfg · .pre-commit-config.yaml
 └── requirements.txt
 ```
